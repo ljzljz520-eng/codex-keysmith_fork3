@@ -197,20 +197,84 @@ jobs:
             printf 'notes_blob=%s\n' "$notes_blob"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Decide the signed-line publication gate (FR-21)
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          signed="$(
+            python scripts/release_publish.py gate \
+              --tag "${{ steps.source.outputs.tag }}" \
+              --policy trust/policy.json
+          )"
+          case "$signed" in
+            true | false) ;;
+            *)
+              echo "Signed-line gate returned an invalid decision: ${signed}" >&2
+              exit 1
+              ;;
+          esac
+          echo "signed=$signed" >> "$GITHUB_OUTPUT"
+
       - name: Build twice and verify reproducibility
         shell: bash
         run: |
           set -euo pipefail
           first="${RUNNER_TEMP}/release-first"
           second="${RUNNER_TEMP}/release-second"
-          python scripts/build_release.py "${{ steps.source.outputs.tag }}" --output-dir "$first"
-          python scripts/build_release.py "${{ steps.source.outputs.tag }}" --output-dir "$second"
+          trust_flags=()
+          if [ "${{ steps.gate.outputs.signed }}" = "true" ]; then
+            sequence="$(
+              python scripts/release_publish.py next-sequence \
+                --line stable --index trust/releases/release-index.json
+            )"
+            authority="$(
+              python scripts/release_publish.py authority-versions \
+                --root-dir trust/root --revocations-dir trust/revocations
+            )"
+            root_version="$(printf '%s\n' "$authority" | sed -n 's/^root=//p')"
+            revocations_version="$(
+              printf '%s\n' "$authority" | sed -n 's/^revocations=//p'
+            )"
+            if [ "$root_version" -lt 1 ]; then
+              echo "Signed-line builds require committed trust/root/root.N.json." >&2
+              exit 1
+            fi
+            issued_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            export CODEX_KEYSMITH_BUILDER_INFO
+            BUILD_TAG="${{ steps.source.outputs.tag }}" \
+              BUILD_WORKFLOW_SHA="${{ github.workflow_sha }}" \
+              CODEX_KEYSMITH_BUILDER_INFO="$(
+                python -c 'import json,os; print(json.dumps({"workflow_name":"Release","workflow_ref":"refs/tags/{}".format(os.environ["BUILD_TAG"]),"workflow_sha":os.environ["BUILD_WORKFLOW_SHA"],"runner":"ubuntu-24.04","python_version":"3.14"},separators=(",",":")))'
+              )"
+            trust_flags=(
+              --emit-trust-artifacts
+              --sequence "$sequence"
+              --issued-at "$issued_at"
+              --source-repo "$GITHUB_REPOSITORY"
+              --required-root-version "$root_version"
+              --required-revocations-version "$revocations_version"
+            )
+          fi
+          python scripts/build_release.py "${{ steps.source.outputs.tag }}" \
+            --output-dir "$first" ${trust_flags[@]+"${trust_flags[@]}"}
+          python scripts/build_release.py "${{ steps.source.outputs.tag }}" \
+            --output-dir "$second" ${trust_flags[@]+"${trust_flags[@]}"}
           diff -u "$first/SHA256SUMS" "$second/SHA256SUMS"
           while read -r checksum asset; do
             test -n "$checksum"
             cmp "$first/$asset" "$second/$asset"
           done < "$first/SHA256SUMS"
           (cd "$first" && sha256sum --check SHA256SUMS)
+          if [ "${{ steps.gate.outputs.signed }}" = "true" ]; then
+            # SHA256SUMS only covers the classic assets: the signed line also
+            # emits dual SBOMs, the standalone verifier and the unsigned
+            # manifest, and every emitted file must be byte-identical across
+            # the two independent builds.
+            while IFS= read -r -d '' path; do
+              cmp "$path" "${path/$first/$second}"
+            done < <(find "$first" -type f -print0 | sort -z)
+          fi
           version_output="$(python "$first/codex-instruct-${{ steps.source.outputs.tag }}.py" --version)"
           expected_version_output="codex-instruct-${{ steps.source.outputs.tag }}.py ${{ steps.source.outputs.version }}"
           if [ "$version_output" != "$expected_version_output" ]; then
@@ -218,7 +282,8 @@ jobs:
             exit 1
           fi
 
-      - name: Stage, verify, and publish GitHub Release
+      - name: Stage, verify, and publish GitHub Release (legacy unsigned line)
+        if: steps.gate.outputs.signed == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
@@ -482,3 +547,188 @@ jobs:
             "$final_state" | sort > "$actual"
           diff -u "$expected" "$actual"
           test "$latest_tag" = "$tag"
+
+      # BEGIN SIGNED-DRAFT-BRANCH (FR-21)
+      # A signed-line tag only ever creates a DRAFT Release in this workflow.
+      # Publication lives exclusively in release-finalize.yml, after the
+      # maintainer offline signing ceremony and the independent verifier
+      # gate. This block must never contain a publish/PATCH action.
+      - name: Stage signed-line draft Release and unsigned trust materials
+        if: steps.gate.outputs.signed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="${RUNNER_TEMP}/release-first"
+          tag="${{ steps.source.outputs.tag }}"
+          expected_tag_object="${{ steps.source.outputs.tag_object }}"
+          expected_commit="${{ steps.source.outputs.commit }}"
+          notes_blob="${{ steps.source.outputs.notes_blob }}"
+          release_id=""
+          release_api=""
+          release_created=false
+          verify_remote_main() {
+            if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+              return 0
+            fi
+            remote_main="$(
+              gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha
+            )"
+            if [ "$GITHUB_REF" != "refs/heads/main" ] \
+              || [ "$WORKFLOW_SHA" != "$GITHUB_SHA" ] \
+              || [ "$remote_main" != "$GITHUB_SHA" ]; then
+              echo "Release recovery workflow commit is no longer the remote main HEAD." >&2
+              return 1
+            fi
+          }
+          verify_remote_tag() {
+            remote_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
+            remote_tag_object="$(printf '%s' "$remote_ref" | jq -r .object.sha)"
+            remote_tag_type="$(printf '%s' "$remote_ref" | jq -r .object.type)"
+            if [ "$remote_tag_type" != "tag" ] \
+              || [ "$remote_tag_object" != "$expected_tag_object" ]; then
+              echo "Remote release tag changed before draft creation." >&2
+              return 1
+            fi
+            remote_tag="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag_object}")"
+            if [ "$(printf '%s' "$remote_tag" | jq -r .tag)" != "$tag" ] \
+              || [ "$(printf '%s' "$remote_tag" | jq -r .object.type)" != "commit" ] \
+              || [ "$(printf '%s' "$remote_tag" | jq -r .object.sha)" != "$expected_commit" ] \
+              || [ "$(printf '%s' "$remote_tag" | jq -r .verification.verified)" != "true" ] \
+              || [ "$(printf '%s' "$remote_tag" | jq -r .verification.reason)" != "valid" ]; then
+              echo "Remote release tag signature or peeled commit changed." >&2
+              return 1
+            fi
+          }
+          cleanup_failed_draft() {
+            primary_status=$?
+            trap - EXIT
+            if [ "$primary_status" -ne 0 ] && [ "$release_created" = true ]; then
+              set +e
+              draft="$(gh api "$release_api" --jq '.draft | tostring' 2>/dev/null)"
+              draft_status=$?
+              set -e
+              if [ "$draft_status" -ne 0 ]; then
+                echo "::warning::Could not read owned draft Release ${release_id}; primary failure preserved."
+              elif [ "$draft" = "true" ]; then
+                if ! gh api -X DELETE "$release_api" --silent; then
+                  echo "::warning::Failed to remove owned unsigned draft Release ${release_id}; primary failure preserved."
+                fi
+              elif [ "$draft" = "false" ]; then
+                echo "::warning::Owned Release ${release_id} is already published; cleanup skipped and primary failure preserved."
+              else
+                echo "::warning::Owned Release ${release_id} returned an invalid draft state; primary failure preserved."
+              fi
+            fi
+            exit "$primary_status"
+          }
+          trap cleanup_failed_draft EXIT
+
+          existing_count="$(
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              | jq -r --arg tag "$tag" 'add | [.[] | select(.tag_name == $tag)] | length'
+          )"
+          if [ "$existing_count" != 0 ]; then
+            echo "Release ${tag} already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+          verify_remote_main
+          verify_remote_tag
+          request="${RUNNER_TEMP}/release-create.json"
+          python - "$tag" "$expected_commit" "$notes_blob" "$request" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          tag, commit, notes_path, request_path = sys.argv[1:]
+          request = {
+              "tag_name": tag,
+              "target_commitish": commit,
+              "name": "codex-keysmith {}".format(tag),
+              "body": Path(notes_path).read_text(encoding="utf-8"),
+              "draft": True,
+              "prerelease": False,
+          }
+          Path(request_path).write_text(
+              json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          PY
+          created_state="${RUNNER_TEMP}/created-release.json"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" \
+            --input "$request" > "$created_state"
+          release_id="$(jq -r '.id // empty' "$created_state")"
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "Draft Release creation did not return a usable numeric ID; ownership is unknown." >&2
+            exit 1
+          fi
+          release_api="repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+          release_created=true
+          upload_url="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets"
+
+          mapfile -t asset_files < <(
+            find "$release_dir" -maxdepth 1 -type f -printf '%f\n' | sort
+          )
+          if [ "${#asset_files[@]}" -lt 1 ]; then
+            echo "No release assets were built; refusing an empty draft." >&2
+            exit 1
+          fi
+          for asset_name in "${asset_files[@]}"; do
+            encoded_name="$(python -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$asset_name")"
+            gh api -X POST \
+              -H "Content-Type: application/octet-stream" \
+              --input "$release_dir/$asset_name" \
+              "${upload_url}?name=${encoded_name}" \
+              --silent
+          done
+
+          expected="${RUNNER_TEMP}/expected-assets.txt"
+          actual="${RUNNER_TEMP}/actual-assets.txt"
+          while IFS= read -r -d '' asset_path; do
+            printf '%s\tsha256:%s\tuploaded\t%s\n' \
+              "$(basename "$asset_path")" \
+              "$(sha256sum "$asset_path" | cut -d' ' -f1)" \
+              "$(wc -c < "$asset_path" | tr -d ' ')"
+          done < <(find "$release_dir" -maxdepth 1 -type f -print0) | sort > "$expected"
+
+          draft_state="${RUNNER_TEMP}/draft-release.json"
+          gh api "$release_api" > "$draft_state"
+          python - "$draft_state" "$notes_blob" "$tag" "$expected_commit" \
+            "$release_id" "$release_dir" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          state_path, notes_path, tag, commit, release_id, release_dir = sys.argv[1:]
+          state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+          expected_names = {p.name for p in Path(release_dir).iterdir() if p.is_file()}
+          assert str(state["id"]) == release_id
+          assert state["tag_name"] == tag
+          assert state["target_commitish"] == commit
+          assert state["name"] == "codex-keysmith {}".format(tag)
+          assert state["draft"] is True
+          assert state["prerelease"] is False
+          assert state["body"].encode("utf-8") == Path(notes_path).read_bytes()
+          assert {a["name"] for a in state["assets"]} == expected_names
+          assert "release-manifest.unsigned.json" in expected_names
+          assert "verify-release-{}.py".format(tag) in expected_names
+          PY
+          jq -r '.assets[] | [.name, .digest, .state, (.size | tostring)] | @tsv' \
+            "$draft_state" | sort > "$actual"
+          diff -u "$expected" "$actual"
+
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          verify_remote_main
+          verify_remote_tag
+          {
+            echo "::notice::Signed-line draft ${tag} stays unpublished until offline signing completes."
+            echo "Maintainer steps: download the draft assets, run the air-gap ceremony"
+            echo "(sign-manifest -> rekor-submit -> sign-index), upload release-manifest.json,"
+            echo "release-index.json and rekor-entry.json to this same draft, then dispatch"
+            echo "the \"Release finalize (signed line)\" workflow from main."
+          }
+      # END SIGNED-DRAFT-BRANCH (FR-21)

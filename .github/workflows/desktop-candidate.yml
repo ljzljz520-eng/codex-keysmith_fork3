@@ -945,6 +945,27 @@ jobs:
           name: codex-keysmith-desktop-windows-x64-${{ github.sha }}
           path: ${{ runner.temp }}/windows-candidate
 
+      - name: Decide the desktop-beta signed publication gate (FR-22)
+        id: gate
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          signed="$(
+            python scripts/release_publish.py gate \
+              --tag "$RELEASE_TAG" --policy trust/policy.json
+          )"
+          case "$signed" in
+            true) ;;
+            false) ;;
+            *)
+              echo "Desktop-beta gate emitted an unexpected verdict: ${signed}" >&2
+              exit 1
+              ;;
+          esac
+          echo "signed=${signed}" >> "$GITHUB_OUTPUT"
+
       - name: Bind main, signed beta tag, candidate, and release notes
         id: source
         shell: bash
@@ -952,6 +973,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           EXPECTED_COMMIT: ${{ inputs.expected_commit }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SIGNED: ${{ steps.gate.outputs.signed }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -1033,15 +1055,61 @@ jobs:
             "$RUNNER_TEMP/macos-candidate/build-manifest.json"
           python scripts/validate_desktop_candidate.py verify-manifest-data \
             "$RUNNER_TEMP/windows-candidate/build-manifest.json"
-          python scripts/package_desktop_prerelease.py assemble \
-            --macos-candidate-dir "$RUNNER_TEMP/macos-candidate" \
-            --windows-candidate-dir "$RUNNER_TEMP/windows-candidate" \
-            --output-dir "$RUNNER_TEMP/desktop-prerelease" \
-            --release-tag "$RELEASE_TAG" \
-            --expected-commit "$EXPECTED_COMMIT"
-          python scripts/package_desktop_prerelease.py verify \
-            "$RUNNER_TEMP/desktop-prerelease" \
-            --expected-commit "$EXPECTED_COMMIT"
+          if [ "$SIGNED" = "true" ]; then
+            # FR-22: derive sequence and authority versions from main, bind
+            # workflow identity via CODEX_KEYSMITH_BUILDER_INFO (toolchain
+            # fields come from the candidate build manifests), and emit the
+            # unsigned manifest, dual SBOMs and standalone verifier.
+            sequence="$(
+              python scripts/release_publish.py next-sequence \
+                --line desktop-beta --index trust/releases/release-index.json
+            )"
+            authority="$(
+              python scripts/release_publish.py authority-versions \
+                --root-dir trust/root --revocations-dir trust/revocations
+            )"
+            root_version="$(printf '%s\n' "$authority" | sed -n 's/^root=//p')"
+            revocations_version="$(
+              printf '%s\n' "$authority" | sed -n 's/^revocations=//p'
+            )"
+            if [ "$root_version" -lt 1 ]; then
+              echo "Signed desktop-beta builds require committed trust/root/root.N.json." >&2
+              exit 1
+            fi
+            issued_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            export CODEX_KEYSMITH_BUILDER_INFO
+            BUILD_TAG="$RELEASE_TAG" \
+            BUILD_WORKFLOW_SHA="$WORKFLOW_SHA" \
+            CODEX_KEYSMITH_BUILDER_INFO="$(
+              python -c 'import json,os; print(json.dumps({"workflow_name":"desktop-candidate.yml","workflow_ref":"refs/tags/{}".format(os.environ["BUILD_TAG"]),"workflow_sha":os.environ["BUILD_WORKFLOW_SHA"],"runner":"GitHub Actions ubuntu-24.04"},separators=(",",":")))'
+            )" \
+            python scripts/package_desktop_prerelease.py assemble \
+              --macos-candidate-dir "$RUNNER_TEMP/macos-candidate" \
+              --windows-candidate-dir "$RUNNER_TEMP/windows-candidate" \
+              --output-dir "$RUNNER_TEMP/desktop-prerelease" \
+              --release-tag "$RELEASE_TAG" \
+              --expected-commit "$EXPECTED_COMMIT" \
+              --emit-trust-artifacts \
+              --trust-sequence "$sequence" \
+              --trust-issued-at "$issued_at" \
+              --source-repo "$GITHUB_REPOSITORY" \
+              --tag-object "$tag_object" \
+              --required-root-version "$root_version" \
+              --required-revocations-version "$revocations_version"
+            python scripts/package_desktop_prerelease.py verify \
+              "$RUNNER_TEMP/desktop-prerelease" \
+              --expected-commit "$EXPECTED_COMMIT" --trust
+          else
+            python scripts/package_desktop_prerelease.py assemble \
+              --macos-candidate-dir "$RUNNER_TEMP/macos-candidate" \
+              --windows-candidate-dir "$RUNNER_TEMP/windows-candidate" \
+              --output-dir "$RUNNER_TEMP/desktop-prerelease" \
+              --release-tag "$RELEASE_TAG" \
+              --expected-commit "$EXPECTED_COMMIT"
+            python scripts/package_desktop_prerelease.py verify \
+              "$RUNNER_TEMP/desktop-prerelease" \
+              --expected-commit "$EXPECTED_COMMIT"
+          fi
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
           {
             printf 'tag=%s\n' "$RELEASE_TAG"
@@ -1052,7 +1120,8 @@ jobs:
             printf 'notes_blob=%s\n' "$notes_blob"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create, verify, and publish the immutable prerelease
+      - name: Create, verify, and publish the immutable prerelease (legacy unsigned desktop line)
+        if: steps.gate.outputs.signed == 'false'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1490,3 +1559,206 @@ jobs:
             echo "Unsigned prerelease unexpectedly changed the repository's Latest Release." >&2
             exit 1
           fi
+
+      # BEGIN SIGNED-DESKTOP-DRAFT-BRANCH (FR-22)
+      # A signed desktop-beta tag only ever creates a DRAFT prerelease in
+      # this workflow. Publication lives exclusively in
+      # release-desktop-finalize.yml, after the maintainer offline signing
+      # ceremony and the independent verifier + Rekor gates. This block must
+      # never contain a publish/PATCH action.
+      - name: Stage signed desktop-beta draft prerelease and unsigned trust materials
+        if: steps.gate.outputs.signed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          release_dir="${RUNNER_TEMP}/desktop-prerelease"
+          tag="${{ steps.source.outputs.tag }}"
+          version="${{ steps.source.outputs.version }}"
+          expected_tag_object="${{ steps.source.outputs.tag_object }}"
+          expected_commit="${{ steps.source.outputs.commit }}"
+          notes_blob="${{ steps.source.outputs.notes_blob }}"
+          release_id=""
+          release_api=""
+          release_created=false
+          get_latest_release_tag() {
+            local repo_owner="${GITHUB_REPOSITORY%%/*}"
+            local repo_name="${GITHUB_REPOSITORY#*/}"
+            gh api graphql \
+              -f query="query(\$owner:String!,\$name:String!){repository(owner:\$owner,name:\$name){latestRelease{tagName}}}" \
+              -F owner="$repo_owner" \
+              -F name="$repo_name" \
+              --jq '.data.repository.latestRelease.tagName // "__NO_LATEST_RELEASE__"'
+          }
+          verify_remote_main() {
+            remote_main="$(
+              gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha
+            )"
+            if [ "$GITHUB_REF" != "refs/heads/main" ] \
+              || [ "$WORKFLOW_SHA" != "$GITHUB_SHA" ] \
+              || [ "$remote_main" != "$GITHUB_SHA" ]; then
+              echo "Desktop prerelease workflow commit is no longer the remote main HEAD." >&2
+              return 1
+            fi
+          }
+          verify_remote_tag() {
+            remote_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
+            remote_tag_object="$(printf '%s' "$remote_ref" | jq -r .object.sha)"
+            remote_tag_type="$(printf '%s' "$remote_ref" | jq -r .object.type)"
+            if [ "$remote_tag_type" != "tag" ] \
+              || [ "$remote_tag_object" != "$expected_tag_object" ]; then
+              echo "Remote desktop beta tag changed before draft creation." >&2
+              return 1
+            fi
+            remote_tag="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag_object}")"
+            if [ "$(printf '%s' "$remote_tag" | jq -r .tag)" != "$tag" ] \
+              || [ "$(printf '%s' "$remote_tag" | jq -r .object.type)" != "commit" ] \
+              || [ "$(printf '%s' "$remote_tag" | jq -r .object.sha)" != "$expected_commit" ] \
+              || [ "$(printf '%s' "$remote_tag" | jq -r .verification.verified)" != "true" ] \
+              || [ "$(printf '%s' "$remote_tag" | jq -r .verification.reason)" != "valid" ]; then
+              echo "Remote desktop beta tag signature or peeled commit changed." >&2
+              return 1
+            fi
+          }
+          cleanup_failed_draft() {
+            primary_status=$?
+            trap - EXIT
+            if [ "$primary_status" -ne 0 ] && [ "$release_created" = true ]; then
+              set +e
+              draft="$(gh api "$release_api" --jq '.draft | tostring' 2>/dev/null)"
+              draft_status=$?
+              set -e
+              if [ "$draft_status" -ne 0 ]; then
+                echo "::warning::Could not read owned desktop draft Release ${release_id}; primary failure preserved."
+              elif [ "$draft" = "true" ]; then
+                if ! gh api -X DELETE "$release_api" --silent; then
+                  echo "::warning::Failed to remove owned unsigned desktop draft Release ${release_id}; primary failure preserved."
+                fi
+              elif [ "$draft" = "false" ]; then
+                echo "::warning::Owned desktop Release ${release_id} is already published; cleanup skipped and primary failure preserved."
+              else
+                echo "::warning::Owned desktop Release ${release_id} returned an invalid draft state; primary failure preserved."
+              fi
+            fi
+            exit "$primary_status"
+          }
+          trap cleanup_failed_draft EXIT
+
+          existing_count="$(
+            gh api --paginate --slurp \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              | jq -r --arg tag "$tag" 'add | [.[] | select(.tag_name == $tag)] | length'
+          )"
+          if [ "$existing_count" != 0 ]; then
+            echo "Desktop prerelease ${tag} already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+          latest_before="$(get_latest_release_tag)"
+          python scripts/package_desktop_prerelease.py verify "$release_dir" \
+            --expected-commit "$expected_commit" --trust
+          verify_remote_main
+          verify_remote_tag
+          request="${RUNNER_TEMP}/desktop-prerelease-create.json"
+          python - "$tag" "$expected_commit" "$notes_blob" "$request" "$version" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          tag, commit, notes_path, request_path, version = sys.argv[1:]
+          request = {
+              "tag_name": tag,
+              "target_commitish": commit,
+              "name": "codex-keysmith {} Desktop Beta".format(version),
+              "body": Path(notes_path).read_text(encoding="utf-8"),
+              "draft": True,
+              "prerelease": True,
+              "make_latest": "false",
+          }
+          Path(request_path).write_text(
+              json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          PY
+          created_state="${RUNNER_TEMP}/desktop-prerelease-created.json"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" \
+            --input "$request" > "$created_state"
+          release_id="$(jq -r '.id // empty' "$created_state")"
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "Desktop draft Release creation did not return a usable numeric ID; ownership is unknown." >&2
+            exit 1
+          fi
+          release_api="repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+          release_created=true
+          upload_url="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets"
+
+          mapfile -t asset_files < <(
+            find "$release_dir" -maxdepth 1 -type f -printf '%f\n' | sort
+          )
+          if [ "${#asset_files[@]}" -lt 1 ]; then
+            echo "No desktop prerelease assets were built; refusing an empty draft." >&2
+            exit 1
+          fi
+          for asset_name in "${asset_files[@]}"; do
+            encoded_name="$(python -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$asset_name")"
+            gh api -X POST \
+              -H "Content-Type: application/octet-stream" \
+              --input "$release_dir/$asset_name" \
+              "${upload_url}?name=${encoded_name}" \
+              --silent
+          done
+
+          expected="${RUNNER_TEMP}/desktop-expected-assets.txt"
+          actual="${RUNNER_TEMP}/desktop-actual-assets.txt"
+          while IFS= read -r -d '' asset_path; do
+            printf '%s\tsha256:%s\tuploaded\t%s\n' \
+              "$(basename "$asset_path")" \
+              "$(sha256sum "$asset_path" | cut -d' ' -f1)" \
+              "$(wc -c < "$asset_path" | tr -d ' ')"
+          done < <(find "$release_dir" -maxdepth 1 -type f -print0) | sort > "$expected"
+
+          draft_state="${RUNNER_TEMP}/desktop-draft-release.json"
+          gh api "$release_api" > "$draft_state"
+          python - "$draft_state" "$notes_blob" "$tag" "$expected_commit" \
+            "$release_id" "$release_dir" "$version" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          state_path, notes_path, tag, commit, release_id, release_dir, version = sys.argv[1:]
+          state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+          expected_names = {p.name for p in Path(release_dir).iterdir() if p.is_file()}
+          assert str(state["id"]) == release_id
+          assert state["tag_name"] == tag
+          assert state["target_commitish"] == commit
+          assert state["name"] == "codex-keysmith {} Desktop Beta".format(version)
+          assert state["draft"] is True
+          assert state["prerelease"] is True
+          assert state["make_latest"] == "false"
+          assert state["body"].encode("utf-8") == Path(notes_path).read_bytes()
+          assert {a["name"] for a in state["assets"]} == expected_names
+          assert "release-manifest.unsigned.json" in expected_names
+          assert "verify-release-{}.py".format(tag) in expected_names
+          PY
+          jq -r '.assets[] | [.name, .digest, .state, (.size | tostring)] | @tsv' \
+            "$draft_state" | sort > "$actual"
+          diff -u "$expected" "$actual"
+
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          verify_remote_main
+          verify_remote_tag
+          latest_after="$(get_latest_release_tag)"
+          if [ "$latest_after" != "$latest_before" ]; then
+            echo "Signed desktop-beta draft unexpectedly changed the repository's Latest Release." >&2
+            exit 1
+          fi
+          {
+            echo "::notice::Signed desktop-beta draft ${tag} stays unpublished until offline signing completes."
+            echo "Maintainer steps: download the draft assets, run the air-gap ceremony"
+            echo "(sign-manifest -> rekor-submit -> sign-index), upload release-manifest.json,"
+            echo "release-index.json and rekor-entry.json to this same draft, then dispatch"
+            echo "the \"Release finalize desktop (signed desktop-beta line)\" workflow from main."
+          }
+      # END SIGNED-DESKTOP-DRAFT-BRANCH (FR-22)

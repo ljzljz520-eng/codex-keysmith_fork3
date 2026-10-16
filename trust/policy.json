@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "spec_version": "1.0.0",
+  "product": "codex-keysmith",
+  "first_signed_version": null,
+  "release_lines": [
+    "stable",
+    "desktop-beta"
+  ],
+  "trust_material": {
+    "root_path_template": "trust/root/root.{version}.json",
+    "revocations_path_template": "trust/revocations/revocations.{version}.json",
+    "release_directory": "trust/releases"
+  },
+  "channels": {
+    "root_url_template": "https://raw.githubusercontent.com/Jia-Ethan/codex-keysmith/main/trust/root/root.{version}.json",
+    "revocations_url_template": "https://raw.githubusercontent.com/Jia-Ethan/codex-keysmith/main/trust/revocations/revocations.{version}.json",
+    "release_index_url_template": "https://raw.githubusercontent.com/Jia-Ethan/codex-keysmith/main/trust/releases/release-index.json"
+  },
+  "rekor": {
+    "base_url": "https://rekor.sigstore.dev",
+    "entries_path": "/api/v1/log/entries",
+    "entry_url_template": "https://rekor.sigstore.dev/api/v1/log/entries/{entry_uuid}"
+  },
+  "revocations_default_expiry_days": 30
+}

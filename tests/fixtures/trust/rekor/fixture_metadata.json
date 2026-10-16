@@ -1,0 +1,23 @@
+{
+  "artifact_message": "codex-keysmith trust test fixture (TR-5.3 harmless test vector)",
+  "artifact_signature_encoding": "ecdsa-asn1-der",
+  "artifact_signature_scheme": "ecdsa-p256-sha256",
+  "binding": {
+    "artifact_scheme": "ecdsa-p256-sha256",
+    "body_sha256": "01b8a05123846a0e70188bcc3e3c866942a9733a2bfa95eef678b799625b112f",
+    "digest_hex": "98d11c8bc1174ee1cf2709e98759525ade2c2c1878762dccfbec0a7c3e0fa0f2",
+    "inclusion_log_index": 3046661183,
+    "integrated_time": 1791566930,
+    "log_id": "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d",
+    "log_index": 3168565445,
+    "public_hex": "041e41874b5cadef8a70b5504bb437d63099e64bf24b3c05abc023101a05df69beea12b23a0ea830e1b1e07011fba29e406dad8401e8c122e018ec625cb100f7db",
+    "root_hash": "0068bd3a4d4c6acc4c3dd49b066eccd1f6846b097ce66f4716d5adafdeb1263c",
+    "root_size": 3046791283,
+    "tree_size": 3046791283
+  },
+  "entry_uuid": "108e9186e8c5677abb479924e76e16c239c0d392796c5c672ffa3d3f192807f4cc100d02168caf6d",
+  "note": "Harmless test vector: the signed digest commits only to a fixed ASCII test string, not to any released artifact.",
+  "recorded_with": "scripts/keysmith_trust.py TR-5.3 recorder",
+  "signed_message": "lower-case ASCII SHA-256 hex digest of artifact_message",
+  "source": "https://rekor.sigstore.dev/api/v1/log/entries/108e9186e8c5677abb479924e76e16c239c0d392796c5c672ffa3d3f192807f4cc100d02168caf6d"
+}

@@ -17156,6 +17156,755 @@ def run_fixture_channel(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Local release-trust integration (FR-20): --trust-status, standalone
+# self-verification and one-time legacy onboarding.
+#
+# This section is intentionally self-contained so the distributed
+# codex-instruct-v<X>.py single file works without the scripts/ package. It
+# only reads JSON state written by the signed-release verifier and therefore
+# needs hashlib/json/pathlib only: no cryptography and no network imports.
+# ---------------------------------------------------------------------------
+
+TRUST_DIR_ENV = "CODEX_KEYSMITH_TRUST_DIR"
+TRUST_HOME_DIRNAME = ".codex-keysmith"
+TRUST_SUBDIR_NAME = "trust"
+TRUST_STATE_FILENAME = "state.json"
+TRUST_AUDIT_FILENAME = "audit.jsonl"
+TRUST_ROOT_CACHE_FILENAME = "root.json"
+TRUST_REVOCATIONS_CACHE_FILENAME = "revocations.json"
+TRUST_MANIFESTS_DIRNAME = "manifests"
+TRUST_STABLE_LINE = "stable"
+TRUST_RELEASE_LINES = ("stable", "desktop-beta")
+TRUST_STATE_SCHEMA_VERSION = 1
+TRUST_SOURCE_TREE_NAME = "codex-instruct.py"
+TRUST_STANDALONE_NAME_RE = re.compile(
+    r"^codex-instruct-v(\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)\.py$"
+)
+TRUST_STANDALONE_ASSET_TEMPLATE = "codex-instruct-v{}.py"
+TRUST_LEGACY_EVENT = "legacy-onboarding"
+TRUST_ONBOARDING_SOURCE = "--trust-onboard-legacy"
+TRUST_AUDIT_TAIL = 10
+TRUST_HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class TrustStatusError(RuntimeError):
+    """Local trust data is missing structurally required content."""
+
+
+def _trust_default_dir() -> Path:
+    override = os.environ.get(TRUST_DIR_ENV)
+    if override:
+        return Path(override)
+    return Path.home() / TRUST_HOME_DIRNAME / TRUST_SUBDIR_NAME
+
+
+def _trust_canonical_sha256(value: Any) -> str:
+    data = (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _trust_read_json_object(path: Path, label: str) -> Dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise TrustStatusError(f"{label} 无法读取: {exc}") from exc
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise TrustStatusError(f"{label} 不是 UTF-8 文本: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise TrustStatusError(f"{label} 不是合法 JSON: {exc.msg}") from exc
+    if not isinstance(value, dict):
+        raise TrustStatusError(f"{label} 必须是 JSON 对象")
+    return value
+
+
+def _trust_require_str(value: Any, label: str, *, empty_allowed: bool = False) -> str:
+    if not isinstance(value, str) or (not empty_allowed and not value):
+        raise TrustStatusError(f"{label} 必须是非空字符串")
+    return value
+
+
+def _trust_validate_state(state: Any) -> Dict[str, Any]:
+    if not isinstance(state, dict):
+        raise TrustStatusError("信任状态必须是 JSON 对象")
+    if set(state) != {"schema_version", "lines"}:
+        raise TrustStatusError("信任状态顶层字段必须恰为 schema_version/lines")
+    if state["schema_version"] != TRUST_STATE_SCHEMA_VERSION:
+        raise TrustStatusError(
+            f"信任状态 schema_version 为 {state['schema_version']!r}，"
+            f"期望 {TRUST_STATE_SCHEMA_VERSION}"
+        )
+    lines = state["lines"]
+    if not isinstance(lines, dict) or set(lines) != set(TRUST_RELEASE_LINES):
+        raise TrustStatusError("信任状态 lines 必须恰好包含 stable 与 desktop-beta")
+    for line in TRUST_RELEASE_LINES:
+        label = f"信任状态 lines.{line}"
+        line_state = lines[line]
+        if not isinstance(line_state, dict) or set(line_state) != {
+            "accepted",
+            "rekor_tree_size",
+            "security_exceptions",
+        }:
+            raise TrustStatusError(f"{label} 字段不完整")
+        accepted = line_state["accepted"]
+        if accepted is not None:
+            if not isinstance(accepted, dict) or set(accepted) != {
+                "version",
+                "sequence",
+                "manifest_hash",
+                "accepted_at",
+            }:
+                raise TrustStatusError(f"{label}.accepted 记录字段不完整")
+            _trust_require_str(accepted["version"], f"{label}.accepted.version")
+            sequence = accepted["sequence"]
+            if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+                raise TrustStatusError(f"{label}.accepted.sequence 必须是 >=1 的整数")
+            manifest_hash = accepted["manifest_hash"]
+            if not isinstance(manifest_hash, str) or not TRUST_HEX32_RE.fullmatch(
+                manifest_hash
+            ):
+                raise TrustStatusError(f"{label}.accepted.manifest_hash 必须是 64 位小写 hex")
+            _trust_require_str(accepted["accepted_at"], f"{label}.accepted.accepted_at")
+        tree_size = line_state["rekor_tree_size"]
+        if not isinstance(tree_size, int) or isinstance(tree_size, bool) or tree_size < 0:
+            raise TrustStatusError(f"{label}.rekor_tree_size 必须是非负整数")
+        exceptions = line_state["security_exceptions"]
+        if not isinstance(exceptions, list):
+            raise TrustStatusError(f"{label}.security_exceptions 必须是数组")
+        seen = set()
+        for index, item in enumerate(exceptions):
+            item_label = f"{label}.security_exceptions[{index}]"
+            if not isinstance(item, dict) or set(item) != {
+                "version",
+                "manifest_hash",
+                "reason",
+                "granted_at",
+            }:
+                raise TrustStatusError(f"{item_label} 字段不完整")
+            _trust_require_str(item["version"], f"{item_label}.version")
+            if not isinstance(item["manifest_hash"], str) or not TRUST_HEX32_RE.fullmatch(
+                item["manifest_hash"]
+            ):
+                raise TrustStatusError(f"{item_label}.manifest_hash 必须是 64 位小写 hex")
+            _trust_require_str(item["reason"], f"{item_label}.reason")
+            _trust_require_str(item["granted_at"], f"{item_label}.granted_at")
+            identity = (item["version"], item["manifest_hash"])
+            if identity in seen:
+                raise TrustStatusError(f"{item_label} 与另一条安全例外完全重复")
+            seen.add(identity)
+    return state
+
+
+def _trust_load_state(trust_dir: Path) -> Optional[Dict[str, Any]]:
+    """Return validated state, or None for a still-uninitialized trust dir."""
+
+    path = trust_dir / TRUST_STATE_FILENAME
+    if not path.exists():
+        return None
+    return _trust_validate_state(_trust_read_json_object(path, "信任状态文件 state.json"))
+
+
+def _trust_load_cached_signed(
+    trust_dir: Path, filename: str, expected_type: str, label: str
+) -> Optional[Dict[str, Any]]:
+    path = trust_dir / filename
+    if not path.exists():
+        return None
+    envelope = _trust_read_json_object(path, label)
+    signed = envelope.get("signed")
+    if not isinstance(signed, dict):
+        raise TrustStatusError(f"{label} 缺少 signed 对象")
+    if signed.get("_type") != expected_type:
+        raise TrustStatusError(
+            f"{label} 的 _type 为 {signed.get('_type')!r}，期望 {expected_type!r}"
+        )
+    return signed
+
+
+def _trust_parse_utc(value: Any, label: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise TrustStatusError(f"{label} 时间戳必须是非空字符串")
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise TrustStatusError(f"{label} 时间戳无法解析: {value!r}") from exc
+    if parsed.tzinfo is None:
+        raise TrustStatusError(f"{label} 时间戳缺少时区: {value!r}")
+    return parsed
+
+
+def _trust_audit_entries(trust_dir: Path) -> List[Dict[str, Any]]:
+    path = trust_dir / TRUST_AUDIT_FILENAME
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TrustStatusError(f"审计日志 {TRUST_AUDIT_FILENAME} 无法读取: {exc}") from exc
+    entries: List[Dict[str, Any]] = []
+    for line_number, raw_line in enumerate(raw.splitlines(), start=1):
+        if not raw_line.strip():
+            raise TrustStatusError(f"审计日志第 {line_number} 行为空")
+        try:
+            entry = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            raise TrustStatusError(
+                f"审计日志第 {line_number} 行不是合法 JSON: {exc.msg}"
+            ) from exc
+        if not isinstance(entry, dict) or not isinstance(entry.get("event"), str):
+            raise TrustStatusError(f"审计日志第 {line_number} 行不是事件对象")
+        entries.append(entry)
+    return entries
+
+
+def read_trust_status(trust_dir: Path) -> Dict[str, Any]:
+    """Read every local trust artifact for display; never writes anything."""
+
+    result: Dict[str, Any] = {
+        "trust_dir": str(trust_dir),
+        "initialized": False,
+        "state": None,
+        "state_error": None,
+        "root": None,
+        "root_error": None,
+        "revocations": None,
+        "revocations_error": None,
+        "audit_tail": [],
+        "audit_error": None,
+    }
+    if not trust_dir.exists():
+        return result
+    try:
+        state = _trust_load_state(trust_dir)
+    except TrustStatusError as exc:
+        result["state_error"] = str(exc)
+    else:
+        result["state"] = state
+        result["initialized"] = state is not None
+
+    try:
+        root_signed = _trust_load_cached_signed(
+            trust_dir, TRUST_ROOT_CACHE_FILENAME, "root", "root 缓存 root.json"
+        )
+    except TrustStatusError as exc:
+        result["root_error"] = str(exc)
+    else:
+        if root_signed is not None:
+            version = root_signed.get("version")
+            if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+                result["root_error"] = "root 缓存缺少合法 version"
+            else:
+                expires_at = str(root_signed.get("expires", ""))
+                try:
+                    expired = _trust_parse_utc(expires_at, "root expires") < datetime.now(
+                        timezone.utc
+                    )
+                except TrustStatusError as exc:
+                    result["root_error"] = str(exc)
+                else:
+                    result["root"] = {
+                        "version": version,
+                        "expires": expires_at,
+                        "expired": expired,
+                        "fingerprint": _trust_canonical_sha256(root_signed),
+                    }
+
+    try:
+        revocations_signed = _trust_load_cached_signed(
+            trust_dir,
+            TRUST_REVOCATIONS_CACHE_FILENAME,
+            "revocations",
+            "revocations 缓存 revocations.json",
+        )
+    except TrustStatusError as exc:
+        result["revocations_error"] = str(exc)
+    else:
+        if revocations_signed is not None:
+            try:
+                expires_at = str(revocations_signed.get("expires", ""))
+                expired = _trust_parse_utc(
+                    expires_at, "revocations expires"
+                ) < datetime.now(timezone.utc)
+                result["revocations"] = {
+                    "version": revocations_signed.get("version"),
+                    "issued_at": revocations_signed.get("issued_at"),
+                    "expires": expires_at,
+                    "expired": expired,
+                }
+            except TrustStatusError as exc:
+                result["revocations_error"] = str(exc)
+
+    try:
+        result["audit_tail"] = _trust_audit_entries(trust_dir)[-TRUST_AUDIT_TAIL:]
+    except TrustStatusError as exc:
+        result["audit_error"] = str(exc)
+    return result
+
+
+def _running_script_path() -> Path:
+    return Path(__file__).resolve()
+
+
+def classify_running_form(script_path: Optional[Path] = None) -> Dict[str, Optional[str]]:
+    path = Path(script_path) if script_path is not None else _running_script_path()
+    name = path.name
+    if name == TRUST_SOURCE_TREE_NAME:
+        return {"form": "source-tree", "version": None}
+    match = TRUST_STANDALONE_NAME_RE.match(name)
+    if match:
+        return {"form": "standalone", "version": match.group(1)}
+    return {"form": "other", "version": None}
+
+
+def _trust_stream_digest(path: Path) -> Tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
+def standalone_self_verification(
+    trust_dir: Path,
+    *,
+    script_path: Optional[Path] = None,
+    state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Bind the running standalone file to its accepted manifest artifact.
+
+    Verdicts:
+      - not-applicable / no-trust-record / no-record-for-version: informational
+      - blocked with a precise reason (state-error, record-unavailable,
+        envelope-invalid, hash-mismatch): deployment-class writes must refuse.
+    """
+
+    identity = classify_running_form(script_path)
+    if identity["form"] != "standalone":
+        return {"verdict": "not-applicable", "blocked": False, **identity}
+    if state is None:
+        try:
+            state = _trust_load_state(trust_dir)
+        except TrustStatusError as exc:
+            return {
+                "verdict": "state-error",
+                "blocked": True,
+                **identity,
+                "detail": str(exc),
+            }
+    accepted = None if state is None else state["lines"][TRUST_STABLE_LINE]["accepted"]
+    if accepted is None:
+        return {"verdict": "no-trust-record", "blocked": False, **identity}
+    if accepted["version"] != identity["version"]:
+        return {
+            "verdict": "no-record-for-version",
+            "blocked": False,
+            **identity,
+            "accepted_version": accepted["version"],
+        }
+    manifest_hash = accepted["manifest_hash"]
+    manifest_path = (
+        trust_dir / TRUST_MANIFESTS_DIRNAME / f"{manifest_hash}.json"
+    )
+    if not manifest_path.is_file():
+        return {
+            "verdict": "record-unavailable",
+            "blocked": True,
+            **identity,
+            "manifest_hash": manifest_hash,
+            "detail": f"缺少已接受发布的 manifest 缓存: {manifest_path}",
+        }
+    try:
+        envelope = _trust_read_json_object(manifest_path, "已接受 manifest 缓存")
+        signed = envelope.get("signed")
+        if not isinstance(signed, dict):
+            raise TrustStatusError("已接受 manifest 缓存缺少 signed 对象")
+        if _trust_canonical_sha256(signed) != manifest_hash:
+            raise TrustStatusError("已接受 manifest 内容与信任状态记录的摘要不一致")
+        if signed.get("release_line") != TRUST_STABLE_LINE:
+            raise TrustStatusError("已接受 manifest 不属于 stable 发布线")
+        if signed.get("version") != accepted["version"]:
+            raise TrustStatusError("已接受 manifest 的 version 与信任状态不一致")
+        artifacts = signed.get("artifacts")
+        if not isinstance(artifacts, dict):
+            raise TrustStatusError("已接受 manifest 缺少 artifacts 映射")
+        artifact_name = TRUST_STANDALONE_ASSET_TEMPLATE.format(accepted["version"])
+        record = artifacts.get(artifact_name)
+        if not isinstance(record, dict):
+            raise TrustStatusError(f"已接受 manifest 未绑定资产 {artifact_name}")
+        expected_digest = record.get("sha256")
+        expected_size = record.get("size")
+        if not isinstance(expected_digest, str) or not TRUST_HEX32_RE.fullmatch(
+            expected_digest
+        ):
+            raise TrustStatusError(f"资产 {artifact_name} 的 sha256 记录无效")
+        if not isinstance(expected_size, int) or isinstance(expected_size, bool):
+            raise TrustStatusError(f"资产 {artifact_name} 的 size 记录无效")
+        target = Path(script_path) if script_path is not None else _running_script_path()
+        actual_digest, actual_size = _trust_stream_digest(target)
+    except (OSError, TrustStatusError) as exc:
+        return {
+            "verdict": "envelope-invalid",
+            "blocked": True,
+            **identity,
+            "manifest_hash": manifest_hash,
+            "detail": str(exc),
+        }
+    if actual_digest != expected_digest or actual_size != expected_size:
+        return {
+            "verdict": "hash-mismatch",
+            "blocked": True,
+            **identity,
+            "manifest_hash": manifest_hash,
+            "artifact": artifact_name,
+            "expected_sha256": expected_digest,
+            "expected_size": expected_size,
+            "actual_sha256": actual_digest,
+            "actual_size": actual_size,
+        }
+    return {
+        "verdict": "verified",
+        "blocked": False,
+        **identity,
+        "manifest_hash": manifest_hash,
+        "artifact": artifact_name,
+    }
+
+
+def _trust_self_check_message(verdict: Dict[str, Any]) -> str:
+    kind = verdict["verdict"]
+    if kind == "hash-mismatch":
+        return _localized(
+            "standalone 信任自校验失败：当前文件与已接受发布 stable {version} 的资产记录"
+            " {artifact} 不一致（期望 sha256 {expected}，实际 {actual}）。"
+            "请先用该发布附带的 verify-release 单文件重新核验；核验通过前拒绝部署类写操作。".format(
+                version=verdict["version"],
+                artifact=verdict["artifact"],
+                expected=verdict["expected_sha256"],
+                actual=verdict["actual_sha256"],
+            ),
+            "standalone trust self-check failed: this file no longer matches the accepted "
+            "stable {version} artifact record {artifact} (expected sha256 {expected}, got "
+            "{actual}). Re-verify with the release verify-release tool first; deployment "
+            "writes are refused until then.".format(
+                version=verdict["version"],
+                artifact=verdict["artifact"],
+                expected=verdict["expected_sha256"],
+                actual=verdict["actual_sha256"],
+            ),
+        )
+    detail = verdict.get("detail", "")
+    return _localized(
+        f"standalone 信任自校验无法完成（{kind}），拒绝部署类写操作：{detail}",
+        f"standalone trust self-check could not complete ({kind}); deployment writes are "
+        f"refused: {detail}",
+    )
+
+
+def _trust_semver_tuple(version: Any) -> Optional[Tuple[int, int, int]]:
+    if not isinstance(version, str):
+        return None
+    core = version.split("+", 1)[0].split("-", 1)[0]
+    parts = core.split(".")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)  # type: ignore[return-value]
+
+
+def read_deployment_tool_version(codex_dir: Path) -> Optional[str]:
+    """Best-effort read of tool_version from an old deployment manifest."""
+
+    path = Path(codex_dir) / MANIFEST_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    version = manifest.get("tool_version")
+    return version if isinstance(version, str) and version else None
+
+
+def find_legacy_deployments(
+    codex_dirs: List[Path], running_version: str
+) -> List[Dict[str, str]]:
+    running = _trust_semver_tuple(running_version)
+    if running is None:
+        return []
+    legacy: List[Dict[str, str]] = []
+    seen = set()
+    for codex_dir in codex_dirs:
+        version = read_deployment_tool_version(codex_dir)
+        parsed = _trust_semver_tuple(version)
+        if parsed is None or parsed >= running or version in seen:
+            continue
+        seen.add(version)
+        legacy.append({"codex_dir": str(codex_dir), "version": version})
+    return legacy
+
+
+def audit_has_legacy_onboarding(trust_dir: Path) -> bool:
+    return any(
+        entry.get("event") == TRUST_LEGACY_EVENT
+        and entry.get("line") == TRUST_STABLE_LINE
+        for entry in _trust_audit_entries(trust_dir)
+    )
+
+
+def legacy_onboarding_plan(
+    trust_dir: Path, codex_dirs: List[Path], running_version: str
+) -> Dict[str, Any]:
+    state = _trust_load_state(trust_dir)
+    if (
+        state is not None
+        and state["lines"][TRUST_STABLE_LINE]["accepted"] is not None
+    ):
+        return {"status": "signed-already"}
+    try:
+        already = audit_has_legacy_onboarding(trust_dir)
+    except TrustStatusError as exc:
+        raise TrustStatusError(f"无法判断 legacy onboarding 历史: {exc}") from exc
+    if already:
+        return {"status": "already-onboarded"}
+    legacy = find_legacy_deployments(codex_dirs, running_version)
+    if not legacy:
+        return {"status": "none-found"}
+    return {"status": "needed", "legacy": legacy}
+
+
+def _trust_append_audit_line(path: Path, entry: Dict[str, Any]) -> None:
+    line = (json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = None
+    try:
+        descriptor = os.open(str(path), flags, 0o600)
+        os.write(descriptor, line)
+    except OSError as exc:
+        raise TrustStatusError(f"无法追加审计记录 {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass
+
+
+def perform_legacy_onboarding(
+    trust_dir: Path,
+    codex_dirs: List[Path],
+    running_version: str,
+    *,
+    source: str = TRUST_ONBOARDING_SOURCE,
+    now_iso: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record exactly one legacy-onboarding audit event per old version."""
+
+    plan = legacy_onboarding_plan(trust_dir, codex_dirs, running_version)
+    if plan["status"] != "needed":
+        return plan
+    if trust_dir.exists():
+        if trust_dir.is_symlink() or not trust_dir.is_dir():
+            raise TrustStatusError(f"信任目录路径不是普通目录: {trust_dir}")
+    else:
+        trust_dir.mkdir(parents=True, mode=0o700)
+    try:
+        os.chmod(str(trust_dir), 0o700)
+    except OSError:
+        pass
+    timestamp = now_iso or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entries: List[Dict[str, Any]] = []
+    for item in plan["legacy"]:
+        entry = {
+            "time": timestamp,
+            "event": TRUST_LEGACY_EVENT,
+            "line": TRUST_STABLE_LINE,
+            "legacy_version": item["version"],
+            "to_version": running_version,
+            "source": source,
+        }
+        _trust_append_audit_line(trust_dir / TRUST_AUDIT_FILENAME, entry)
+        entries.append(entry)
+    return {"status": "onboarded", "entries": entries, "legacy": plan["legacy"]}
+
+
+def _trust_scan_codex_dirs(codex_dir_arg: Optional[str]) -> List[Path]:
+    if codex_dir_arg:
+        return [Path(codex_dir_arg)]
+    return [Path(item) for item in find_codex_dirs()]
+
+
+def _print_trust_status(
+    status: Dict[str, Any],
+    self_check: Dict[str, Any],
+    onboarding: Optional[Dict[str, Any]],
+) -> None:
+    _print(
+        _localized(
+            "── 本地发布信任状态 ──",
+            "── Local release-trust status ──"
+        )
+    )
+    _print(f"trust dir: {status['trust_dir']}")
+    if status["state_error"]:
+        _print(f"[!] {status['state_error']}")
+    if status["root_error"]:
+        _print(f"[!] {status['root_error']}")
+    if status["revocations_error"]:
+        _print(f"[!] {status['revocations_error']}")
+    if status["audit_error"]:
+        _print(f"[!] {status['audit_error']}")
+    root = status["root"]
+    if root:
+        expired = " [EXPIRED]" if root["expired"] else ""
+        _print(
+            f"root: v{root['version']} expires {root['expires']}{expired} "
+            f"fingerprint {root['fingerprint']}"
+        )
+    revocations = status["revocations"]
+    if revocations:
+        expired = " [EXPIRED]" if revocations["expired"] else ""
+        _print(
+            f"revocations: v{revocations['version']} issued {revocations['issued_at']} "
+            f"expires {revocations['expires']}{expired}"
+        )
+    state = status["state"]
+    if state is None and not status["state_error"]:
+        _print(
+            _localized(
+                "尚未接受任何签名发布（空信任目录）。请使用签名发布附带的 "
+                "verify-release-<tag>.py 验证器完成首次 TOFU 核验。",
+                "No signed release has been accepted yet (empty trust directory). Run the "
+                "verify-release-<tag>.py verifier shipped with a signed release to perform "
+                "the first TOFU verification.",
+            )
+        )
+    elif state is not None:
+        for line in TRUST_RELEASE_LINES:
+            line_state = state["lines"][line]
+            accepted = line_state["accepted"]
+            if accepted is None:
+                _print(f"line {line}: no accepted release")
+                continue
+            _print(
+                f"line {line}: accepted {accepted['version']} sequence "
+                f"{accepted['sequence']} at {accepted['accepted_at']} "
+                f"manifest {accepted['manifest_hash']} rekor-tree "
+                f"{line_state['rekor_tree_size']}"
+            )
+            for item in line_state["security_exceptions"]:
+                _print(
+                    f"  active security exception: {item['version']} "
+                    f"({item['reason']}) granted {item['granted_at']}"
+                )
+    audit_tail = status["audit_tail"]
+    if audit_tail:
+        _print(_localized("最近审计事件:", "Recent audit events:"))
+        for entry in audit_tail:
+            _print("  " + json.dumps(entry, ensure_ascii=False, sort_keys=True))
+    form = self_check.get("form")
+    if form == "standalone":
+        _print(
+            "standalone self-check: {} (version {})".format(
+                self_check["verdict"], self_check.get("version")
+            )
+        )
+        if self_check.get("blocked"):
+            _print(f"  [!] {_trust_self_check_message(self_check)}")
+    elif form:
+        _print(f"standalone self-check: {self_check['verdict']} ({form})")
+    if onboarding is not None and onboarding.get("status") == "needed":
+        versions = ", ".join(sorted({item["version"] for item in onboarding["legacy"]}))
+        _print(
+            _localized(
+                f"检测到未签名旧版本部署 ({versions})；确认迁移请加 "
+                f"{TRUST_ONBOARDING_SOURCE} 重新运行（只记录一次审计，不阻断既有功能）。",
+                f"Unsigned legacy deployment detected ({versions}); rerun with "
+                f"{TRUST_ONBOARDING_SOURCE} to record the one-time onboarding audit event "
+                f"(existing functionality is not blocked).",
+            )
+        )
+
+
+def run_trust_status_command(trust_dir: Path, codex_dirs: List[Path]) -> int:
+    status = read_trust_status(trust_dir)
+    self_check = standalone_self_verification(
+        trust_dir, state=status["state"] if status["state_error"] is None else None
+    )
+    onboarding: Optional[Dict[str, Any]] = None
+    if status["state"] is not None and status["state"]["lines"][TRUST_STABLE_LINE][
+        "accepted"
+    ] is None:
+        try:
+            onboarding = legacy_onboarding_plan(trust_dir, codex_dirs, VERSION)
+        except TrustStatusError as exc:
+            status["audit_error"] = str(exc)
+    elif status["state"] is None and not status["state_error"]:
+        onboarding = legacy_onboarding_plan(trust_dir, codex_dirs, VERSION)
+    _print_trust_status(status, self_check, onboarding)
+    failed = any(
+        status[key]
+        for key in ("state_error", "root_error", "revocations_error", "audit_error")
+    )
+    return 1 if failed else 0
+
+
+def run_legacy_onboarding_command(trust_dir: Path, codex_dirs: List[Path]) -> int:
+    try:
+        result = perform_legacy_onboarding(
+            trust_dir, codex_dirs, VERSION, source=TRUST_ONBOARDING_SOURCE
+        )
+    except TrustStatusError as exc:
+        _print(f"[错误] {exc}")
+        return 1
+    status = result["status"]
+    if status == "onboarded":
+        for entry in result["entries"]:
+            _print(
+                _localized(
+                    f"[审计] legacy-onboarding: {entry['legacy_version']} -> "
+                    f"{entry['to_version']} @ {entry['time']}",
+                    f"[audit] legacy-onboarding: {entry['legacy_version']} -> "
+                    f"{entry['to_version']} @ {entry['time']}",
+                )
+            )
+        return 0
+    if status == "already-onboarded":
+        _print(
+            _localized(
+                "legacy onboarding 已记录过，不重复记账。",
+                "legacy onboarding was already recorded; not counting it again.",
+            )
+        )
+        return 0
+    if status == "signed-already":
+        _print(
+            _localized(
+                "本机已有签名发布 accepted 记录，无需 legacy onboarding。",
+                "A signed release is already accepted; legacy onboarding is unnecessary.",
+            )
+        )
+        return 0
+    _print(
+        _localized(
+            "未发现由更旧未签名版本写入的部署清单，未记录 legacy-onboarding 事件。",
+            "No deployment manifest from an older unsigned release was found; no "
+            "legacy-onboarding event recorded.",
+        )
+    )
+    return 1
+
+
 def main() -> None:
     _configure_output_streams()
     _set_output_language(_language_from_argv(sys.argv[1:]))
@@ -17174,6 +17923,8 @@ def main() -> None:
   %(prog)s --codex-dir ~/.codex --recover --yes    执行部署/卸载事务恢复
   %(prog)s --codex-dir ~/.codex --reactivate       预览只恢复缺失的顶层字段
   %(prog)s --codex-dir ~/.codex --reactivate --yes 补回 inactive-by-config 的字段
+  %(prog)s --trust-status                    只读查看本地签名发布信任状态
+  %(prog)s --trust-onboard-legacy            记录一次性未签名旧版本迁移审计
   %(prog)s --codex-dir ~/.codex --skip-hooks-isolation --yes
                                                 部署但保持 hooks 活跃
   %(prog)s --scenario-list                    静态列出源码场景库
@@ -17200,6 +17951,8 @@ Examples:
   %(prog)s --codex-dir ~/.codex --recover --yes    Recover an interrupted deploy/uninstall
   %(prog)s --codex-dir ~/.codex --reactivate       Preview restoring the missing top-level field
   %(prog)s --codex-dir ~/.codex --reactivate --yes Restore the inactive-by-config field only
+  %(prog)s --trust-status                    Show local signed-release trust status
+  %(prog)s --trust-onboard-legacy            Record the one-time unsigned-era upgrade audit
   %(prog)s --codex-dir ~/.codex --skip-hooks-isolation --yes
                                                 Deploy while leaving hooks active
   %(prog)s --scenario-list                    Statically list source scenarios
@@ -17321,6 +18074,23 @@ Examples:
         action="store_true",
         help="Preview or recover one interrupted target-local scenario transaction",
     )
+    operation_group.add_argument(
+        "--trust-status",
+        action="store_true",
+        help=_localized(
+            "只读查看本地签名发布信任状态（root、两线水位、撤销、审计）",
+            "Read-only local signed-release trust status (root, line water-marks, "
+            "revocations, audit)",
+        ),
+    )
+    parser.add_argument(
+        "--trust-onboard-legacy",
+        action="store_true",
+        help=_localized(
+            "一次性记录未签名旧版本迁移的 legacy-onboarding 审计事件",
+            "Record the one-time legacy-onboarding audit event for an unsigned-era upgrade",
+        ),
+    )
     parser.add_argument(
         "--yes",
         action="store_true",
@@ -17425,6 +18195,22 @@ Examples:
         )
     args.preset = explicit_preset or PRESET_OVERLAY
 
+    trust_dir = _trust_default_dir()
+    if args.trust_status:
+        if args.trust_onboard_legacy or args.yes or args.restore_hooks:
+            parser.error(
+                _localized(
+                    "--trust-status 为只读命令，不能与写操作或 --trust-onboard-legacy 同时使用",
+                    "--trust-status is read-only and conflicts with write operations "
+                    "and --trust-onboard-legacy",
+                )
+            )
+        sys.exit(
+            run_trust_status_command(
+                trust_dir, _trust_scan_codex_dirs(args.codex_dir)
+            )
+        )
+
     scaffold_selectors = [
         bool(args.scaffold),
         bool(args.scaffold_list),
@@ -17521,6 +18307,33 @@ Examples:
 
     if args.target_dir or args.scenario_root:
         parser.error("--target-dir and --scenario-root require a scenario command")
+
+    # FR-20: a released standalone file must match its accepted manifest
+    # artifact before any deployment-class write; source-tree runs and
+    # un-verified versions only get informational treatment.
+    if args.yes or args.restore_hooks:
+        trust_verdict = standalone_self_verification(trust_dir)
+        if trust_verdict.get("blocked"):
+            _print(f"[错误] {_trust_self_check_message(trust_verdict)}")
+            sys.exit(1)
+
+    if args.trust_onboard_legacy:
+        onboarding_rc = run_legacy_onboarding_command(
+            trust_dir, _trust_scan_codex_dirs(args.codex_dir)
+        )
+        other_operation = any(
+            (
+                args.dry_run,
+                args.restore_hooks,
+                args.status,
+                args.uninstall,
+                args.recover,
+                args.reactivate,
+                args.yes,
+            )
+        )
+        if onboarding_rc or not other_operation:
+            sys.exit(onboarding_rc)
 
     if args.status and (
         hasattr(args, "file")

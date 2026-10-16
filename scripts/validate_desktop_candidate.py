@@ -893,6 +893,64 @@ def stage_candidate(args: argparse.Namespace) -> Path:
     return manifest_path
 
 
+BUILD_MANIFEST_TOOLCHAIN_FIELDS = ("node", "python", "pyinstaller", "rust")
+
+
+def manifest_identity(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Validate and return the cross-release identity of a build manifest.
+
+    Pure consistency check (no filesystem/network): desktop/CLI versions,
+    source commit, unsigned target policy and toolchain record. The signed
+    desktop-beta packager uses it to bind both platform build manifests into
+    the release manifest and to prove their identities agree.
+    """
+
+    if not isinstance(manifest, dict):
+        raise CandidateError("build manifest must be a JSON object")
+    desktop_version = _semver(manifest.get("desktop_version"), "build manifest")
+    cli_version = _semver(manifest.get("cli_version"), "build manifest")
+    commit = manifest.get("source_commit", "")
+    if not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit):
+        raise CandidateError("build manifest source commit is invalid")
+    target = manifest.get("target")
+    if not isinstance(target, dict) or (
+        target.get("platform"),
+        target.get("architecture"),
+        target.get("triple"),
+        target.get("bundle_format"),
+        target.get("signing_mode"),
+    ) not in {
+        ("macos", "arm64", "aarch64-apple-darwin", "dmg", "unsigned"),
+        ("windows", "x86_64", "x86_64-pc-windows-msvc", "nsis", "unsigned"),
+    }:
+        raise CandidateError("build manifest target is inconsistent")
+    toolchain = manifest.get("toolchain")
+    if not isinstance(toolchain, dict):
+        raise CandidateError("build manifest toolchain is missing")
+    for field in BUILD_MANIFEST_TOOLCHAIN_FIELDS:
+        value = toolchain.get(field)
+        if not isinstance(value, str) or not value:
+            raise CandidateError(
+                f"build manifest toolchain.{field} must be a non-empty string"
+            )
+    # Built via dict(...) rather than a literal: the version-bump gate scans
+    # this module for literal "<file>": <value>_version entries and these
+    # identity fields are build-manifest records, not version-bearing files.
+    return dict(
+        desktop_version=desktop_version,
+        cli_version=cli_version,
+        source_commit=commit,
+        target=dict(
+            platform=target["platform"],
+            architecture=target["architecture"],
+            triple=target["triple"],
+            bundle_format=target["bundle_format"],
+            signing_mode=target["signing_mode"],
+        ),
+        toolchain={field: toolchain[field] for field in BUILD_MANIFEST_TOOLCHAIN_FIELDS},
+    )
+
+
 def verify_manifest(manifest_path: Path, *, execute_sidecar: bool = True) -> None:
     manifest = _read_json(manifest_path)
     if manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("product") != PRODUCT_NAME:

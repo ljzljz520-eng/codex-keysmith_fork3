@@ -1,0 +1,388 @@
+name: Release finalize desktop (signed desktop-beta line)
+
+# Finalize a signed desktop-beta draft prerelease created by
+# desktop-candidate.yml (FR-22):
+#   1. main-only manual dispatch with the expected annotated tag object and
+#      peeled commit (recovery-ceremony style inputs);
+#   2. download the draft assets including the three signed materials the
+#      maintainer produced on the offline machine (release-manifest.json,
+#      release-index.json, rekor-entry.json) and uploaded to the draft;
+#   3. independently re-verify everything with scripts/verify_release.py on
+#      the desktop-beta line (root/revocations come from the main checkout,
+#      never from the draft; signatures, digests, index pinning and Rekor
+#      inclusion are checked);
+#   4. commit the signed materials to trust/releases/ on main as an extra
+#      immutable channel;
+#   5. only then PATCH the draft to published, keeping prerelease=true and
+#      make_latest=false so desktop betas never take the Latest Release slot.
+# Any failure leaves the Release a draft.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Signed desktop-beta tag to finalize, for example desktop-v0.7.0-beta.1.
+        required: true
+        type: string
+      expected_tag_object:
+        description: Full immutable annotated tag-object SHA expected on GitHub.
+        required: true
+        type: string
+      expected_commit:
+        description: Full peeled commit SHA expected for the tagged source.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-desktop-finalize
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    name: Verify, pin materials, and publish signed desktop-beta draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out current main with push credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Guard dispatch and bind tag, HEAD and expected SHAs
+        id: bind
+        env:
+          DISPATCH_TAG: ${{ inputs.release_tag }}
+          DISPATCH_TAG_OBJECT: ${{ inputs.expected_tag_object }}
+          DISPATCH_COMMIT: ${{ inputs.expected_commit }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "Desktop finalize is only available as a manual workflow dispatch." >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Desktop finalize must run from refs/heads/main." >&2
+            exit 1
+          fi
+          if [ "$WORKFLOW_SHA" != "$GITHUB_SHA" ]; then
+            echo "Desktop finalize must run from the current main workflow commit." >&2
+            exit 1
+          fi
+          remote_main="$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha
+          )"
+          if [ "$remote_main" != "$GITHUB_SHA" ]; then
+            echo "Desktop finalize workflow commit is not the remote main HEAD." >&2
+            exit 1
+          fi
+          tag="$DISPATCH_TAG"
+          expected_tag_object="$DISPATCH_TAG_OBJECT"
+          expected_commit="$DISPATCH_COMMIT"
+          python scripts/release_publish.py check-refs \
+            --tag "$tag" \
+            --tag-object "$expected_tag_object" \
+            --commit "$expected_commit"
+          if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+            echo "Desktop finalize requires a complete checkout." >&2
+            exit 1
+          fi
+          {
+            printf 'tag=%s\n' "$tag"
+            printf 'tag_object=%s\n' "$expected_tag_object"
+            printf 'commit=%s\n' "$expected_commit"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Independently verify the remote annotated desktop beta tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.bind.outputs.tag }}"
+          expected_tag_object="${{ steps.bind.outputs.tag_object }}"
+          expected_commit="${{ steps.bind.outputs.commit }}"
+          remote_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
+          remote_tag_object="$(printf '%s' "$remote_ref" | jq -r .object.sha)"
+          remote_tag_type="$(printf '%s' "$remote_ref" | jq -r .object.type)"
+          if [ "$remote_tag_type" != "tag" ] \
+            || [ "$remote_tag_object" != "$expected_tag_object" ]; then
+            echo "Remote ref does not identify the expected annotated desktop beta tag object." >&2
+            exit 1
+          fi
+          remote_tag="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_tag_object}")"
+          if [ "$(printf '%s' "$remote_tag" | jq -r .tag)" != "$tag" ] \
+            || [ "$(printf '%s' "$remote_tag" | jq -r .object.type)" != "commit" ] \
+            || [ "$(printf '%s' "$remote_tag" | jq -r .object.sha)" != "$expected_commit" ] \
+            || [ "$(printf '%s' "$remote_tag" | jq -r .verification.verified)" != "true" ] \
+            || [ "$(printf '%s' "$remote_tag" | jq -r .verification.reason)" != "valid" ]; then
+            echo "Remote desktop beta tag signature or peeled commit verification failed." >&2
+            exit 1
+          fi
+
+      - name: Download the draft desktop prerelease assets
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.bind.outputs.tag }}"
+          release_json="${RUNNER_TEMP}/desktop-draft-release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" > "$release_json"
+          python - "$release_json" "$tag" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          state_path, tag = sys.argv[1:]
+          state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+          assert state["tag_name"] == tag
+          assert state["draft"] is True, "release {} is already published".format(tag)
+          assert state["prerelease"] is True
+          assert state["make_latest"] == "false"
+          assert str(state["id"]).isdigit()
+          assert state["assets"], "draft desktop prerelease has no assets"
+          PY
+          release_id="$(jq -r '.id' "$release_json")"
+          release_api="repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+          release_dir="${RUNNER_TEMP}/desktop-release-dir"
+          mkdir -p "$release_dir"
+          while IFS=$'\t' read -r asset_id asset_name; do
+            test -n "$asset_id"
+            case "$asset_name" in
+              *"/"* | *".."* | "")
+                echo "Refusing draft asset with unsafe name: ${asset_name}" >&2
+                exit 1
+                ;;
+            esac
+            gh api -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "$release_dir/$asset_name"
+          done < <(jq -r '.assets[] | [.id, .name] | @tsv' "$release_json")
+          # Missing or malformed signed materials fail here, long before
+          # anything can be published.
+          python scripts/release_publish.py check-materials --release-dir "$release_dir"
+          {
+            printf 'release_id=%s\n' "$release_id"
+            printf 'release_api=%s\n' "$release_api"
+            printf 'release_dir=%s\n' "$release_dir"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Independently verify the signed desktop-beta release and stage trust materials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.bind.outputs.tag }}"
+          release_dir="${{ steps.draft.outputs.release_dir }}"
+          finalize_json="${RUNNER_TEMP}/desktop-finalize.json"
+          # Root and revocations are read from the main checkout by the
+          # helper; the verifier runs as an isolated subprocess and checks
+          # signatures, every bound digest, the desktop-beta release-index
+          # pin and the Rekor inclusion proof offline.
+          python scripts/release_publish.py finalize \
+            --release-dir "$release_dir" \
+            --tag "$tag" \
+            --line desktop-beta \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --trust-dir "${RUNNER_TEMP}/desktop-finalize-trust" \
+            --json | tee "$finalize_json"
+          python - "$finalize_json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          record = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          assert record["ok"] is True
+          assert record["line"] == "desktop-beta"
+          assert record["tag"]
+          assert record["manifest_hash"]
+          assert record["staged"], "finalize must stage signed materials"
+          assert all(
+              path.startswith("trust/releases/") for path in record["staged"]
+          ), record["staged"]
+          PY
+
+      - name: Commit the signed desktop-beta materials to main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.bind.outputs.tag }}"
+          expected_tag_object="${{ steps.bind.outputs.tag_object }}"
+          expected_commit="${{ steps.bind.outputs.commit }}"
+          base_main="$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha
+          )"
+          if [ "$base_main" != "$GITHUB_SHA" ]; then
+            echo "Remote main advanced after checkout; rerun desktop finalize from the new HEAD." >&2
+            exit 1
+          fi
+          remote_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
+          if [ "$(printf '%s' "$remote_ref" | jq -r .object.type)" != "tag" ] \
+            || [ "$(printf '%s' "$remote_ref" | jq -r .object.sha)" != "$expected_tag_object" ]; then
+            echo "Remote desktop beta tag changed before pinning materials." >&2
+            exit 1
+          fi
+          remote_tag="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${expected_tag_object}")"
+          if [ "$(printf '%s' "$remote_tag" | jq -r .object.sha)" != "$expected_commit" ] \
+            || [ "$(printf '%s' "$remote_tag" | jq -r .verification.verified)" != "true" ]; then
+            echo "Remote desktop beta tag verification failed before pinning materials." >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add trust/releases
+          if git diff --cached --quiet; then
+            echo "No signed material changes to commit; the desktop finalize gate produced nothing." >&2
+            exit 1
+          fi
+          if [ -n "$(git diff --cached --name-only | grep -v '^trust/releases/' || true)" ]; then
+            echo "Only trust/releases/ may be committed by desktop finalize." >&2
+            exit 1
+          fi
+          git commit -m "trust: pin signed desktop-beta materials for ${tag}"
+          git push origin HEAD:refs/heads/main
+          git fetch origin refs/heads/main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse refs/remotes/origin/main)" ]; then
+            echo "Pushed commit is not the remote main HEAD; refusing to publish." >&2
+            exit 1
+          fi
+
+      - name: Publish the verified draft desktop prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.bind.outputs.tag }}"
+          expected_tag_object="${{ steps.bind.outputs.tag_object }}"
+          expected_commit="${{ steps.bind.outputs.commit }}"
+          release_api="${{ steps.draft.outputs.release_api }}"
+          get_latest_release_tag() {
+            local repo_owner="${GITHUB_REPOSITORY%%/*}"
+            local repo_name="${GITHUB_REPOSITORY#*/}"
+            gh api graphql \
+              -f query="query(\$owner:String!,\$name:String!){repository(owner:\$owner,name:\$name){latestRelease{tagName}}}" \
+              -F owner="$repo_owner" \
+              -F name="$repo_name" \
+              --jq '.data.repository.latestRelease.tagName // "__NO_LATEST_RELEASE__"'
+          }
+          remote_ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")"
+          if [ "$(printf '%s' "$remote_ref" | jq -r .object.type)" != "tag" ] \
+            || [ "$(printf '%s' "$remote_ref" | jq -r .object.sha)" != "$expected_tag_object" ]; then
+            echo "Remote desktop beta tag changed before publication." >&2
+            exit 1
+          fi
+          remote_tag="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${expected_tag_object}")"
+          if [ "$(printf '%s' "$remote_tag" | jq -r .object.sha)" != "$expected_commit" ] \
+            || [ "$(printf '%s' "$remote_tag" | jq -r .verification.verified)" != "true" ]; then
+            echo "Remote desktop beta tag verification failed before publication." >&2
+            exit 1
+          fi
+          pre_publish="${RUNNER_TEMP}/desktop-pre-publish.json"
+          gh api "$release_api" > "$pre_publish"
+          python - "$pre_publish" "$tag" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          state_path, tag = sys.argv[1:]
+          state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+          assert state["tag_name"] == tag
+          assert state["draft"] is True, "refusing to PATCH a non-draft Release"
+          assert state["prerelease"] is True
+          assert state["make_latest"] == "false"
+          names = {asset["name"] for asset in state["assets"]}
+          for required in (
+              "release-manifest.json",
+              "release-index.json",
+              "rekor-entry.json",
+              "release-manifest.unsigned.json",
+          ):
+              assert required in names, "draft is missing {}".format(required)
+          PY
+          latest_before="$(get_latest_release_tag)"
+          publish_error="${RUNNER_TEMP}/desktop-release-publish-error.txt"
+          set +e
+          published="$(gh api -X PATCH "$release_api" \
+            -F draft=false \
+            -f make_latest=false \
+            -f prerelease=true \
+            2> "$publish_error"
+          )"
+          publish_status=$?
+          set -e
+          if [ "$publish_status" -ne 0 ]; then
+            published="$(gh api "$release_api" 2>/dev/null || true)"
+            published_draft="$(
+              printf '%s' "$published" | jq -r '.draft | tostring' 2>/dev/null || true
+            )"
+            if [ "$published_draft" != "false" ]; then
+              cat "$publish_error" >&2
+              exit "$publish_status"
+            fi
+            echo "::warning::Publish response was lost, but numeric-ID verification confirms publication; continuing final verification."
+          fi
+          if [ "$(printf '%s' "$published" | jq -r .draft)" != "false" ] \
+            || [ "$(printf '%s' "$published" | jq -r .prerelease | tostring)" != "true" ] \
+            || [ "$(printf '%s' "$published" | jq -r .tag_name)" != "$tag" ]; then
+            echo "Desktop prerelease publication response did not confirm the expected state." >&2
+            exit 1
+          fi
+          for _attempt in {1..10}; do
+            published_state="$(gh api "$release_api" 2>/dev/null || true)"
+            latest_after="$(get_latest_release_tag)"
+            if [ "$(printf '%s' "$published_state" | jq -r '.draft | tostring' 2>/dev/null)" = "false" ] \
+              && [ "$(printf '%s' "$published_state" | jq -r '.prerelease | tostring' 2>/dev/null)" = "true" ] \
+              && [ -n "$(printf '%s' "$published_state" | jq -r '.published_at // empty' 2>/dev/null)" ] \
+              && [ "$latest_after" = "$latest_before" ]; then
+              break
+            fi
+            sleep 1
+          done
+          final_state="${RUNNER_TEMP}/desktop-published-release.json"
+          printf '%s' "$published_state" > "$final_state"
+          python - "$final_state" "$tag" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          state_path, tag = sys.argv[1:]
+          state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+          assert state["tag_name"] == tag
+          assert state["draft"] is False
+          assert state["prerelease"] is True
+          assert state["make_latest"] == "false"
+          assert state["published_at"]
+          names = {asset["name"] for asset in state["assets"]}
+          for required in (
+              "release-manifest.json",
+              "release-index.json",
+              "rekor-entry.json",
+              "release-manifest.unsigned.json",
+          ):
+              assert required in names, "published desktop prerelease is missing {}".format(required)
+          PY
+          if [ "$(get_latest_release_tag)" != "$latest_before" ]; then
+            echo "Signed desktop-beta finalize unexpectedly changed the repository's Latest Release." >&2
+            exit 1
+          fi

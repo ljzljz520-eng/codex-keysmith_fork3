@@ -1361,7 +1361,9 @@ def test_ci_uses_full_tag_checkout_and_blocking_windows_matrix():
     assert "|| github.sha }}" in release_workflow
     assert "refs/tags/${tag}^{commit}" in release_workflow
     assert "github.workflow_sha" in release_workflow
-    assert release_workflow.count('git/ref/heads/main" --jq .object.sha') == 2
+    # Bind ritual, legacy publish step, and the signed-line draft branch each
+    # independently pin the run against current remote main (FR-21).
+    assert release_workflow.count('git/ref/heads/main" --jq .object.sha') == 3
     assert "git merge-base --is-ancestor" in release_workflow
     assert "git/ref/tags/${tag}" in release_workflow
     assert "jq -r .tag" in release_workflow

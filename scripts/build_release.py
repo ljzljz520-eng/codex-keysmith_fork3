@@ -18,6 +18,11 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Sequence, Tuple
 
+# Allow both ``python -m scripts.build_release`` and direct execution
+# (``python scripts/build_release.py``, the form used by CI release jobs).
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 ARCHIVE_FILES = (
     "CHANGELOG.md",
     "CODE_SIGNING_POLICY.md",
@@ -56,6 +61,20 @@ ARCHIVE_FILES = (
     "scripts/ks-envelope.py",
     "scripts/ks-envelope-deploy.py",
 )
+
+# Trust-tooling sources are added to the archives only when
+# --emit-trust-artifacts is enabled, so default asset bytes never change.
+TRUST_ARCHIVE_FILES = (
+    "scripts/generate_sbom.py",
+    "scripts/keysmith_signing.py",
+    "scripts/keysmith_trust.py",
+    "scripts/verify_release.py",
+)
+UNSIGNED_MANIFEST_NAME = "release-manifest.unsigned.json"
+BUILDER_INFO_ENV_VAR = "CODEX_KEYSMITH_BUILDER_INFO"
+SOURCE_REPO_ENV_VAR = "CODEX_KEYSMITH_SOURCE_REPO"
+LOCAL_SOURCE_REPO = "local"
+TRUST_EXECUTABLE_SCRIPTS = frozenset(TRUST_ARCHIVE_FILES)
 
 SCENARIO_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 SCENARIO_SEMVER_PATTERN = re.compile(
@@ -590,9 +609,14 @@ def _validate_version(tag: str, sources: Dict[str, bytes]) -> str:
     return version
 
 
-def _read_and_validate_sources(repo_root: Path, tag: str) -> Tuple[str, Dict[str, bytes]]:
+def _read_and_validate_sources(
+    repo_root: Path,
+    tag: str,
+    extra_source_files: Sequence[str] = (),
+) -> Tuple[str, Dict[str, bytes]]:
     archive_files = (
         ARCHIVE_FILES
+        + tuple(extra_source_files)
         + _scenario_archive_files(repo_root)
         + _fixture_pack_archive_files(repo_root)
     )
@@ -736,8 +760,11 @@ def _read_release_sources(
     repo_root: Path,
     tag: str,
     source_commit: str,
+    extra_source_files: Sequence[str] = (),
 ) -> Tuple[str, Dict[str, bytes], Dict[str, int]]:
-    version, sources = _read_and_validate_sources(repo_root, tag)
+    version, sources = _read_and_validate_sources(
+        repo_root, tag, extra_source_files=extra_source_files
+    )
     gui_sources, gui_modes = _tracked_gui_sources(repo_root, source_commit)
     collisions = set(sources).intersection(gui_sources)
     if collisions:
@@ -1154,6 +1181,7 @@ def _archive_mode(relative_path: str) -> int:
         "scripts/ks-envelope.py",
         "scripts/ks-envelope-deploy.py",
     }
+        | TRUST_EXECUTABLE_SCRIPTS
         else 0o644
     )
 
@@ -1343,25 +1371,311 @@ def _rollback_published_assets(created: Sequence[Tuple[Path, bytes]]) -> List[st
     return errors
 
 
+# ---------------------------------------------------------------------------
+# Trusted-release manifest production (opt-in via --emit-trust-artifacts)
+# ---------------------------------------------------------------------------
+
+VERIFIER_STANDALONE_NAME = "verify-release-{}.py"
+VERIFIER_ENGINE_MARKER = b'KEYSMITH_TRUST_ENGINE_PAYLOAD = None\n'
+_REQUIRED_BUILDER_STRINGS = (
+    "workflow_name",
+    "workflow_ref",
+    "workflow_sha",
+    "runner",
+    "python_version",
+)
+_OPTIONAL_BUILDER_STRINGS = ("node_version", "rust_version", "pyinstaller_version")
+
+
+def _normalise_builder_info(raw: object) -> Dict[str, object]:
+    if not isinstance(raw, dict):
+        raise ReleaseError("trusted builds require a builder info object")
+    builder: Dict[str, object] = {}
+    for field in _REQUIRED_BUILDER_STRINGS:
+        value = raw.get(field)
+        if not isinstance(value, str) or not value:
+            raise ReleaseError("builder info requires non-empty string {!r}".format(field))
+        builder[field] = value
+    try:
+        if len(builder["workflow_sha"]) not in (40, 64) or any(
+            ch not in "0123456789abcdef" for ch in builder["workflow_sha"]
+        ):
+            raise ValueError
+    except ValueError as exc:
+        raise ReleaseError(
+            "builder info workflow_sha must be 40 or 64 lowercase hex chars"
+        ) from exc
+    for field in _OPTIONAL_BUILDER_STRINGS:
+        value = raw.get(field, "")
+        if not isinstance(value, str):
+            raise ReleaseError("builder info {!r} must be a string".format(field))
+        builder[field] = value
+    build_manifests = raw.get("build_manifests", {})
+    if not isinstance(build_manifests, dict):
+        raise ReleaseError("builder info build_manifests must be an object")
+    normalised_manifests: Dict[str, str] = {}
+    for name, digest in build_manifests.items():
+        if not isinstance(name, str) or not isinstance(digest, str):
+            raise ReleaseError("builder info build_manifests entries must be strings")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ReleaseError(
+                "builder info build_manifests.{} must be a 32-byte sha256 hex".format(name)
+            )
+        normalised_manifests[name] = digest
+    builder["build_manifests"] = normalised_manifests
+    unexpected = set(raw) - set(_REQUIRED_BUILDER_STRINGS) - set(
+        _OPTIONAL_BUILDER_STRINGS
+    ) - {"build_manifests"}
+    if unexpected:
+        raise ReleaseError("builder info contains unsupported field(s): {}".format(
+            ", ".join(sorted(unexpected))))
+    return builder
+
+
+def _resolve_annotated_tag_object(repo_root: Path, tag: str) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "{}^{{tag}}".format(tag)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        raise ReleaseError("cannot resolve the annotated tag object: {}".format(exc)) from exc
+    if result.returncode != 0:
+        raise ReleaseError(
+            "trusted releases require an annotated tag object ({} is lightweight)".format(tag)
+        )
+    tag_object = result.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", tag_object):
+        raise ReleaseError("annotated tag object is not a 40-char hex sha1")
+    return tag_object
+
+
+def _verifier_standalone_bytes(
+    verifier_source: bytes, engine_source: bytes, license_text: bytes
+) -> bytes:
+    """Compose the single-file offline verifier (engine payload injected)."""
+
+    if not verifier_source.startswith(b"#!"):
+        raise ReleaseError("scripts/verify_release.py must start with a shebang")
+    shebang, separator, body = verifier_source.partition(b"\n")
+    if not separator:
+        raise ReleaseError("scripts/verify_release.py is missing script content")
+    if VERIFIER_ENGINE_MARKER not in body:
+        raise ReleaseError(
+            "scripts/verify_release.py must expose the engine injection marker"
+        )
+    commented_license = b"\n".join(
+        b"# " + line if line else b"#" for line in license_text.rstrip(b"\n").splitlines()
+    )
+    encoded_engine = base64.b64encode(engine_source).decode("ascii")
+    payload = 'KEYSMITH_TRUST_ENGINE_PAYLOAD = "{}"\n'.format(encoded_engine).encode("ascii")
+    body = body.replace(VERIFIER_ENGINE_MARKER, payload, 1)
+    return (
+        shebang
+        + b"\n#\n# Standalone release asset license notice:\n"
+        + commented_license
+        + b"\n#\n"
+        + body
+    )
+
+
+def _file_digest_and_size(path: Path) -> Tuple[str, int]:
+    return _sha256(path), path.stat().st_size
+
+
+def _record_artifact(path: Path) -> Dict[str, object]:
+    digest_hex, size = _file_digest_and_size(path)
+    return {"sha256": digest_hex, "size": size}
+
+
+def _render_manifest_bytes(manifest: Dict[str, object]) -> bytes:
+    return (
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def _emit_trust_artifacts(
+    *,
+    repo_root: Path,
+    tag: str,
+    staging_dir: Path,
+    sources: Dict[str, bytes],
+    core_asset_names: Sequence[str],
+    checksum_name: str,
+    source_commit: str,
+    tag_object: str,
+    source_repo: str,
+    sequence: int,
+    issued_at: str,
+    builder: Dict[str, object],
+    required_root_version: int,
+    required_revocations_version: int,
+) -> Tuple[List[Tuple[Path, str, int]], Dict[str, object]]:
+    """Build SBOMs, standalone verifier and unsigned manifest in staging.
+
+    Returns ``((staging_path, final_asset_name, mode), ...), manifest``.
+    """
+
+    from scripts import generate_sbom
+    from scripts import keysmith_trust as trust
+
+    version = tag[1:]
+    verifier_name = VERIFIER_STANDALONE_NAME.format(tag)
+    verifier_path = staging_dir / verifier_name
+    verifier_path.write_bytes(
+        _verifier_standalone_bytes(
+            sources["scripts/verify_release.py"],
+            sources["scripts/keysmith_trust.py"],
+            sources["LICENSE"],
+        )
+    )
+    verifier_path.chmod(0o755)
+
+    fixed_files = tuple(sorted(
+        set(ARCHIVE_FILES)
+        | set(TRUST_ARCHIVE_FILES)
+        | {"docs/releases/{}.md".format(tag)}
+    ))
+    try:
+        spdx_document, cdx_document, _ = generate_sbom.build_documents(
+            repo_root=repo_root,
+            release_line=trust.STABLE_LINE,
+            version=version,
+            issued_at=issued_at,
+            source_commit=source_commit,
+            builder=builder,
+            fixed_files=fixed_files,
+        )
+    except generate_sbom.SbomError as exc:
+        raise ReleaseError("release SBOM generation failed: {}".format(exc)) from exc
+    spdx_name, cdx_name = generate_sbom.sbom_asset_names(tag)
+    spdx_path = staging_dir / spdx_name
+    cdx_path = staging_dir / cdx_name
+    spdx_path.write_bytes(generate_sbom.render_document(spdx_document))
+    cdx_path.write_bytes(generate_sbom.render_document(cdx_document))
+    spdx_path.chmod(0o644)
+    cdx_path.chmod(0o644)
+
+    artifact_names = list(core_asset_names) + [checksum_name, verifier_name]
+    artifacts: Dict[str, object] = {}
+    for name in artifact_names:
+        artifacts[name] = _record_artifact(staging_dir / name)
+    sboms = {
+        spdx_name: _record_artifact(spdx_path),
+        cdx_name: _record_artifact(cdx_path),
+    }
+
+    manifest: Dict[str, object] = {
+        "_type": trust.RELEASE_TYPE,
+        "spec_version": trust.SPEC_VERSION,
+        "product": trust.PRODUCT,
+        "release_line": trust.STABLE_LINE,
+        "version": version,
+        "tag": tag,
+        "sequence": sequence,
+        "issued_at": issued_at,
+        "source": {
+            "repo": source_repo,
+            "commit": source_commit,
+            "tag_object": tag_object,
+        },
+        "builder": builder,
+        "artifacts": artifacts,
+        "sboms": sboms,
+        "required_root_version": required_root_version,
+        "required_revocations_version": required_revocations_version,
+    }
+    try:
+        trust.validate_release_manifest(manifest)
+    except trust.MetadataError as exc:
+        raise ReleaseError("unsigned release manifest failed validation: {}".format(exc)) from exc
+    manifest_path = staging_dir / UNSIGNED_MANIFEST_NAME
+    manifest_path.write_bytes(_render_manifest_bytes(manifest))
+    manifest_path.chmod(0o644)
+
+    extras = [
+        (verifier_path, verifier_name, 0o755),
+        (spdx_path, spdx_name, 0o644),
+        (cdx_path, cdx_name, 0o644),
+        (manifest_path, UNSIGNED_MANIFEST_NAME, 0o644),
+    ]
+    return extras, manifest
+
+
 def build_release(
     tag: str,
     repo_root: Path,
     output_dir: Path,
     require_clean: bool = True,
     source_commit: Optional[str] = None,
+    emit_trust_artifacts: bool = False,
+    trust_sequence: Optional[int] = None,
+    trust_issued_at: Optional[str] = None,
+    builder_info: Optional[Dict[str, object]] = None,
+    source_repo: str = LOCAL_SOURCE_REPO,
+    required_root_version: int = 1,
+    required_revocations_version: int = 0,
 ) -> List[Path]:
     """Validate the source tree and write a deterministic release asset set."""
     repo_root = repo_root.resolve()
     output_dir = Path(os.path.abspath(str(output_dir)))
+    extra_source_files = TRUST_ARCHIVE_FILES if emit_trust_artifacts else ()
+    if not emit_trust_artifacts and (
+        trust_sequence is not None
+        or trust_issued_at is not None
+        or builder_info is not None
+        or source_repo != LOCAL_SOURCE_REPO
+        or required_root_version != 1
+        or required_revocations_version != 0
+    ):
+        raise ReleaseError(
+            "trust-only options require --emit-trust-artifacts"
+        )
+    if emit_trust_artifacts:
+        if not isinstance(trust_sequence, int) or isinstance(trust_sequence, bool) or (
+            trust_sequence < 1
+        ):
+            raise ReleaseError("--sequence must be an integer >= 1 with --emit-trust-artifacts")
+        if not isinstance(trust_issued_at, str) or not trust_issued_at:
+            raise ReleaseError("--issued-at is required with --emit-trust-artifacts")
+        try:
+            from scripts import keysmith_trust as trust
+
+            trust.require_iso8601_utc(trust_issued_at, "issued_at")
+        except trust.MetadataError as exc:
+            raise ReleaseError(str(exc)) from exc
+        if not isinstance(source_repo, str) or not source_repo:
+            raise ReleaseError("source repo identifier must be a non-empty string")
+        if (
+            not isinstance(required_root_version, int)
+            or isinstance(required_root_version, bool)
+            or required_root_version < 1
+        ):
+            raise ReleaseError("required root metadata version must be an integer >= 1")
+        if (
+            not isinstance(required_revocations_version, int)
+            or isinstance(required_revocations_version, bool)
+            or required_revocations_version < 0
+        ):
+            raise ReleaseError("required revocations version must be a non-negative integer")
+        normalised_builder = _normalise_builder_info(builder_info)
     # Preserve the public validation order: reject malformed tags and version
     # drift before consulting Git refs for the selected source commit.
-    _read_and_validate_sources(repo_root, tag)
+    _read_and_validate_sources(
+        repo_root, tag, extra_source_files=extra_source_files
+    )
     _require_complete_git_checkout(repo_root)
     validated_source = _resolve_source_commit(repo_root, tag, source_commit)
+    tag_object = (
+        _resolve_annotated_tag_object(repo_root, tag) if emit_trust_artifacts else ""
+    )
     version, sources, source_modes = _read_release_sources(
         repo_root,
         tag,
         validated_source,
+        extra_source_files=extra_source_files,
     )
     _validate_sources_match_commit(repo_root, validated_source, sources)
     _validate_gui_worktree_matches_commit(repo_root, sources)
@@ -1376,7 +1690,22 @@ def build_release(
         "codex-instruct-{}.py".format(tag),
         scenario_bundle_asset_name(tag),
     )
-    final_paths = [output_dir / name for name in asset_names + ("SHA256SUMS",)]
+    checksum_name = "SHA256SUMS"
+    trust_extra_names: List[str] = []
+    if emit_trust_artifacts:
+        from scripts import generate_sbom
+
+        spdx_asset, cdx_asset = generate_sbom.sbom_asset_names(tag)
+        trust_extra_names = [
+            VERIFIER_STANDALONE_NAME.format(tag),
+            spdx_asset,
+            cdx_asset,
+            UNSIGNED_MANIFEST_NAME,
+        ]
+    final_paths = [
+        output_dir / name
+        for name in list(asset_names) + [checksum_name] + trust_extra_names
+    ]
     _validate_output_destinations(final_paths)
     with tempfile.TemporaryDirectory(prefix=".keysmith-release-", dir=str(output_dir)) as temp:
         staging_dir = Path(temp)
@@ -1405,10 +1734,29 @@ def build_release(
         checksum_lines = [
             "{}  {}".format(_sha256(staging_dir / name), name) for name in sorted(asset_names)
         ]
-        checksum_path = staging_dir / "SHA256SUMS"
+        checksum_path = staging_dir / checksum_name
         checksum_path.write_text("\n".join(checksum_lines) + "\n", encoding="ascii")
         for path in (zip_path, tar_path, bundle_path, checksum_path):
             path.chmod(0o644)
+
+        trust_extra_files: List[Tuple[Path, str, int]] = []
+        if emit_trust_artifacts:
+            trust_extra_files, _manifest = _emit_trust_artifacts(
+                repo_root=repo_root,
+                tag=tag,
+                staging_dir=staging_dir,
+                sources=sources,
+                core_asset_names=asset_names,
+                checksum_name=checksum_name,
+                source_commit=validated_source,
+                tag_object=tag_object,
+                source_repo=source_repo,
+                sequence=trust_sequence,
+                issued_at=trust_issued_at,
+                builder=normalised_builder,
+                required_root_version=required_root_version,
+                required_revocations_version=required_revocations_version,
+            )
 
         final_source = _resolve_source_commit(repo_root, tag, source_commit)
         if final_source != validated_source:
@@ -1417,6 +1765,7 @@ def build_release(
             repo_root,
             tag,
             final_source,
+            extra_source_files=extra_source_files,
         )
         if final_version != version or final_sources != sources or final_modes != source_modes:
             raise ReleaseError("release source files changed during the build")
@@ -1425,8 +1774,10 @@ def build_release(
         if require_clean:
             _require_clean_repository(repo_root, output_dir)
 
+        staged_core = (zip_path, tar_path, script_path, bundle_path, checksum_path)
+        staged_all = tuple(staged_core) + tuple(item[0] for item in trust_extra_files)
         created = _publish_assets_without_overwrite(
-            (zip_path, tar_path, script_path, bundle_path, checksum_path),
+            staged_all,
             final_paths,
         )
         try:
@@ -1441,6 +1792,7 @@ def build_release(
                 repo_root,
                 tag,
                 published_source,
+                extra_source_files=extra_source_files,
             )
             if (
                 published_version != version
@@ -1500,7 +1852,64 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         help="write only the sealed scenarios.bundle and exit",
     )
+    parser.add_argument(
+        "--emit-trust-artifacts",
+        action="store_true",
+        help=(
+            "also emit the unsigned release manifest, dual SBOMs and the "
+            "standalone offline verifier (requires an annotated tag)"
+        ),
+    )
+    parser.add_argument(
+        "--sequence",
+        dest="trust_sequence",
+        type=int,
+        help="monotonic release-manifest sequence number (>= 1)",
+    )
+    parser.add_argument(
+        "--issued-at",
+        dest="trust_issued_at",
+        help="UTC ISO-8601 manifest timestamp, e.g. 2026-02-15T10:00:00Z",
+    )
+    parser.add_argument(
+        "--builder-info",
+        help=(
+            "JSON object describing the build environment; defaults to the "
+            "{} environment variable".format(BUILDER_INFO_ENV_VAR)
+        ),
+    )
+    parser.add_argument(
+        "--source-repo",
+        help="canonical source repository identifier recorded in the manifest",
+    )
+    parser.add_argument(
+        "--required-root-version",
+        type=int,
+        default=1,
+        help="minimum root metadata version verifiers must hold (default: 1)",
+    )
+    parser.add_argument(
+        "--required-revocations-version",
+        type=int,
+        default=0,
+        help="minimum revocations metadata version verifiers must hold (default: 0)",
+    )
     return parser.parse_args(argv)
+
+
+def _builder_info_from_args(args: argparse.Namespace) -> Optional[Dict[str, object]]:
+    raw = args.builder_info
+    if raw is None:
+        raw = os.environ.get(BUILDER_INFO_ENV_VAR)
+    if raw is None or raw == "":
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ReleaseError("builder info must be valid JSON: {}".format(exc)) from exc
+    if not isinstance(parsed, dict):
+        raise ReleaseError("builder info must be a JSON object")
+    return parsed
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1528,6 +1937,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.repo_root,
             args.output_dir,
             source_commit=args.source_commit,
+            emit_trust_artifacts=args.emit_trust_artifacts,
+            trust_sequence=args.trust_sequence,
+            trust_issued_at=args.trust_issued_at,
+            builder_info=_builder_info_from_args(args),
+            source_repo=(
+                args.source_repo
+                if args.source_repo is not None
+                else os.environ.get(SOURCE_REPO_ENV_VAR, LOCAL_SOURCE_REPO)
+            ),
+            required_root_version=args.required_root_version,
+            required_revocations_version=args.required_revocations_version,
         )
     except ReleaseError as exc:
         print("release build failed: {}".format(exc), file=sys.stderr)
